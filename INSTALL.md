@@ -252,7 +252,7 @@ mangohud ./WiiCompiled
 
 MangoHud shows FPS, frame times, the Vulkan driver, GPU name and utilisation. It reads
 `~/.config/MangoHud/MangoHud.conf`; set `fps_only=0` there to see the full panel. On Windows use
-the MangoHud build from its releases with the same command (`mangohud WiiCompiled.exe`).
+your GPU driver's overlay instead (AMD: <kbd>Alt</kbd>+<kbd>R</kbd>, NVIDIA: <kbd>Alt</kbd>+<kbd>Z</kbd>).
 
 ---
 
