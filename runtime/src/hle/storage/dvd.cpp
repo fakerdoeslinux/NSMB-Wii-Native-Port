@@ -20,7 +20,7 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -107,12 +107,13 @@ static std::vector<DVDFileEntry> g_fileEntries;
 // The game's reads (course and object archives, and the music it streams while playing) run on the
 // one host thread every guest thread shares, so a slow read stalls the frame. Each read used to open
 // the file again, which on a busy PC (antivirus and sync filters, a hard disk) took long enough to
-// drop frames during play. On Windows the whole disc (about 340 MB) is read into memory once, on a
-// background thread at the lowest I/O priority, and reads are then served from it. Android does the
-// same on phones with 3 GB of RAM or more (the game itself takes under 1 GB): there the game files
-// sit in the app's shared storage, where every open goes through FUSE, and a scene change's reads
-// cost 30-110 ms of its load frame on a Pixel 3 XL. Until the cache has a file, Android reads it
-// with pread on a descriptor kept open, so a file is opened once rather than on every read.
+// drop frames during play. On Windows and Linux the whole disc (about 340 MB) is read into memory
+// once, on a background thread at the lowest I/O priority, and reads are then served from it.
+// Android does the same on phones with 3 GB of RAM or more (the game itself takes under 1 GB): there
+// the game files sit in the app's shared storage, where every open goes through FUSE, and a scene
+// change's reads cost 30-110 ms of its load frame on a Pixel 3 XL. Until the cache has a file, the
+// read goes through pread on a descriptor kept open, so a file is opened once rather than on every
+// read.
 namespace {
 
 using FileBytes = std::shared_ptr<const std::vector<uint8_t>>;
@@ -127,7 +128,7 @@ FileBytes CachedFile(const fs::path& path) {
     return it != g_readCache.end() ? it->second : nullptr;
 }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__linux__)
 // Files the game has read, kept open (with their sizes), so the next read of one skips the open.
 struct OpenFile {
     int fd = -1;
@@ -210,7 +211,7 @@ bool ReadHostFile(const fs::path& path, uint64_t offset, uint32_t length, std::v
             ok = true;
         }
     } else {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__linux__)
         ok = ReadWithOpenFile(path, offset, length, destination, failure);
 #else
         ok = DvdReadContract::ReadExact(path, offset, length, destination, failure);
@@ -225,14 +226,22 @@ bool ReadHostFile(const fs::path& path, uint64_t offset, uint32_t length, std::v
 }
 
 void StartReadCachePreload() {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__linux__)
+    // Phones use the cache from 3 GB of RAM up; a desktop needs a little more headroom (4 GB) to
+    // spend 335 MB (or more with mods) on it. Below that the plain kept-descriptor reads are used.
+    // NSMBW_NO_DVD_PRELOAD forces that behaviour anywhere, including on Windows.
     const uint64_t ram = static_cast<uint64_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<uint64_t>(sysconf(_SC_PAGE_SIZE));
-    if (ram < (3ull << 30) || std::getenv("NSMBW_NO_DVD_PRELOAD") != nullptr) {
+#if defined(__ANDROID__)
+    constexpr uint64_t kReadCacheRamFloor = 3ull << 30;
+#else
+    constexpr uint64_t kReadCacheRamFloor = 4ull << 30;
+#endif
+    if (ram < kReadCacheRamFloor || std::getenv("NSMBW_NO_DVD_PRELOAD") != nullptr) {
         RT_LOGF(RT_TAG_DVD, "read cache: off (%llu MiB of RAM)\n", static_cast<unsigned long long>(ram >> 20));
         return;
     }
 #endif
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__linux__)
     constexpr uint64_t kCacheLimitBytes = 1ull << 30;  // mods can be larger than the disc; stop at 1 GiB
     std::vector<fs::path> paths;
     for (const DVDFileEntry& entry : g_fileEntries) {
