@@ -1,0 +1,232 @@
+// android_bridge.cpp - JNI entry points the Android app (com.wither.nsmbw) calls into libmain.so.
+#if defined(__ANDROID__)
+
+#include "display_settings.h"
+#include "host_suspend.h"
+#include "graphics_info.h"
+#include "runtime_config.h"
+#include "settings_overlay.h"
+#include "updater.h"
+#include "virtual_remote.h"
+
+#include "netplay/net_socket.h"
+#include "netplay_session.h"
+#include "netplay_start.h"
+#include "netplay_ui.h"
+
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <thread>
+
+namespace AndroidBridge {
+
+// Network play: ask the activity to start the game again in a fresh process (GameActivity
+// .restartForSession), then park this thread until Android ends the process.
+bool RestartGame() {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return false;
+    }
+    jclass type = env->GetObjectClass(activity);
+    jmethodID restart = type != nullptr ? env->GetMethodID(type, "restartForSession", "()V") : nullptr;
+    if (restart == nullptr) {
+        env->ExceptionClear();
+        return false;
+    }
+    env->CallVoidMethod(activity, restart);
+    env->DeleteLocalRef(activity);
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// The file select's Update button: GameActivity.startGameUpdate runs the app's updater (Updater.java),
+// which reports back through nativeUpdateStatus.
+bool StartAppUpdate() {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return false;
+    }
+    jclass type = env->GetObjectClass(activity);
+    jmethodID start = type != nullptr ? env->GetMethodID(type, "startGameUpdate", "()V") : nullptr;
+    if (start == nullptr) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(activity);
+        return false;
+    }
+    env->CallVoidMethod(activity, start);
+    env->DeleteLocalRef(activity);
+    return true;
+}
+
+} // namespace AndroidBridge
+
+extern "C" {
+
+// GameActivity.nativeSetTouchState: the on-screen remote (VirtualRemote::TouchButton bits) and the
+// phone's motion (shake, tilt -1..1) for player 1. Called from the UI thread on every change.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeSetTouchState(
+    JNIEnv*, jclass, jint buttons, jboolean shake, jfloat tilt)
+{
+    VirtualRemote::SetTouchState(static_cast<uint32_t>(buttons), shake == JNI_TRUE, tilt);
+}
+
+// GameActivity.nativeApplyDisplaySettings: the Display menu. The aspect (0 original 4:3, 1 16:9,
+// 2 fill the screen) and the render scale (480 lines per 1x) apply at the next frame; 4:3 versus a
+// widescreen mode only at the next start, since the game reads it at boot. performanceMonitor: the
+// FPS counter and frametime graph.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeApplyDisplaySettings(
+    JNIEnv*, jclass, jint aspect, jfloat renderScale, jboolean performanceMonitor)
+{
+    // Through the settings overlay, so the game's own settings window shows the same choice. A scale
+    // of 0 is "match the screen".
+    settings_overlay::SetAspect(aspect < 0 || aspect > 2 ? DisplaySettings::kAspectFill : static_cast<int32_t>(aspect));
+    settings_overlay::SetRenderScale(renderScale >= 0.0f ? renderScale : 1.0f);
+    if (settings_overlay::FrameGraph() != (performanceMonitor == JNI_TRUE)) {
+        settings_overlay::SetFrameGraph(performanceMonitor == JNI_TRUE);
+    }
+}
+
+// GameActivity.nativeGraphicsInfo: the GPU the game is drawing with and whether the GPU
+// compatibility fixes are on, as "<name>\n<1|0>"; empty until the renderer has started.
+JNIEXPORT jstring JNICALL Java_com_wither_nsmbw_GameActivity_nativeGraphicsInfo(JNIEnv* env, jclass)
+{
+    const std::string name = GraphicsInfo::Name();
+    if (name.empty()) {
+        return env->NewStringUTF("");
+    }
+    const std::string info = name + "\n" + (GraphicsInfo::CompatActive() ? "1" : "0");
+    return env->NewStringUTF(info.c_str());
+}
+
+// GameActivity.nativeSetDeviceName: what this phone is called in room lists.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeSetDeviceName(JNIEnv* env, jclass, jstring name)
+{
+    if (name == nullptr) {
+        return;
+    }
+    const char* utf8 = env->GetStringUTFChars(name, nullptr);
+    if (utf8 != nullptr) {
+        Netplay::SetDeviceName(utf8);
+        env->ReleaseStringUTFChars(name, utf8);
+    }
+}
+
+// GameActivity.nativeSessionActive: whether this run is a LAN session (the menu offers to leave it).
+JNIEXPORT jboolean JNICALL Java_com_wither_nsmbw_GameActivity_nativeSessionActive(JNIEnv*, jclass)
+{
+    return NetplaySession::Active() ? JNI_TRUE : JNI_FALSE;
+}
+
+// GameActivity.nativePrepareToLeave: the menu's "Leave LAN game", before the app restarts the game.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativePrepareToLeave(JNIEnv*, jclass)
+{
+    NetplayStart::PrepareToLeave();
+}
+
+// GameActivity.nativeUpdateStatus: what the app's updater found or is doing (Updater::State as a
+// number; progress 0..1, or -1 unknown).
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeUpdateStatus(
+    JNIEnv* env, jclass, jint state, jstring version, jfloat progress, jstring message)
+{
+    const auto text = [env](jstring s) {
+        std::string out;
+        if (s != nullptr) {
+            if (const char* utf8 = env->GetStringUTFChars(s, nullptr)) {
+                out = utf8;
+                env->ReleaseStringUTFChars(s, utf8);
+            }
+        }
+        return out;
+    };
+    if (state < 0 || state > static_cast<jint>(Updater::State::Failed)) {
+        return;
+    }
+    Updater::SetFromApp(static_cast<Updater::State>(state), text(version), progress, text(message));
+}
+
+// GameActivity.nativeTap: a tap on the game's menus, as fractions of the screen (netplay_ui.h).
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativePointer(JNIEnv*, jclass, jfloat x, jfloat y,
+                                                                      jboolean held)
+{
+    NetplayUi::Pointer(x, y, held != JNI_FALSE);
+}
+
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeTap(JNIEnv*, jclass, jfloat x, jfloat y)
+{
+    NetplayUi::Tap(x, y);
+}
+
+// GameActivity.nativeTakeSettings: {render scale, show FPS 1/0, aspect, spinning coins 1/0, frame graph 1/0,
+// V-Sync 1/0, frametime graph size %, touch controls 1/0 or -1 unchanged, renderer 0 automatic / 1 Vulkan /
+// 2 OpenGL ES or -1 unchanged} when the game's settings window changed them since the last call, else null;
+// the app saves them for the next start.
+JNIEXPORT jfloatArray JNICALL Java_com_wither_nsmbw_GameActivity_nativeTakeSettings(JNIEnv* env, jclass)
+{
+    float scale = 1.0f;
+    bool showFps = false;
+    int aspect = DisplaySettings::kAspectFill;
+    bool spinningCoins = true;
+    bool frameGraph = false;
+    bool vsync = false;
+    int frameGraphSize = 50;
+    int touchControls = -1;
+    int renderer = -1;
+    if (!NetplayUi::TakeSettingsChange(scale, showFps, aspect, spinningCoins, frameGraph, vsync, frameGraphSize,
+                                       touchControls, renderer)) {
+        return nullptr;
+    }
+    constexpr jsize kCount = 9;
+    jfloatArray result = env->NewFloatArray(kCount);
+    const jfloat values[kCount] = {scale, showFps ? 1.0f : 0.0f, static_cast<jfloat>(aspect), spinningCoins ? 1.0f : 0.0f,
+                                   frameGraph ? 1.0f : 0.0f, vsync ? 1.0f : 0.0f, static_cast<jfloat>(frameGraphSize),
+                                   static_cast<jfloat>(touchControls), static_cast<jfloat>(renderer)};
+    env->SetFloatArrayRegion(result, 0, kCount, values);
+    return result;
+}
+
+// GameActivity.nativeSetTouchControls: the app's touch controls setting, which the Keybinds tab shows.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeSetTouchControls(JNIEnv*, jclass, jboolean on)
+{
+    settings_overlay::SetTouchControls(on != JNI_FALSE);
+}
+
+// GameActivity.nativeTapScreen: whether a menu that taps drive is up (the app hides its remote).
+JNIEXPORT jboolean JNICALL Java_com_wither_nsmbw_GameActivity_nativeTapScreen(JNIEnv*, jclass)
+{
+    return NetplayUi::TapScreenUp() ? JNI_TRUE : JNI_FALSE;
+}
+
+// GameActivity.nativePlaying: in a course or on the world map with no menu up (NetplayUi::Playing).
+JNIEXPORT jboolean JNICALL Java_com_wither_nsmbw_GameActivity_nativePlaying(JNIEnv*, jclass)
+{
+    return NetplayUi::Playing() ? JNI_TRUE : JNI_FALSE;
+}
+
+// GameActivity.nativeSetBackground: the app left the screen (true) or came back (false). Leaving, the
+// game writes a backup Quick Save (backup: the app left; not when the screen just turned off) and
+// pauses (host_suspend.h); nativeGamePaused says when it has.
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeSetBackground(JNIEnv*, jclass, jboolean background,
+                                                                             jboolean backup)
+{
+    if (background) {
+        HostSuspend::RequestPause(backup != JNI_FALSE);
+    } else {
+        HostSuspend::RequestResume();
+    }
+}
+
+JNIEXPORT jboolean JNICALL Java_com_wither_nsmbw_GameActivity_nativeGamePaused(JNIEnv*, jclass)
+{
+    return HostSuspend::Paused() ? JNI_TRUE : JNI_FALSE;
+}
+
+} // extern "C"
+
+#endif // __ANDROID__

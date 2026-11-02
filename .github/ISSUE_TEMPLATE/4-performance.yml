@@ -1,0 +1,84 @@
+name: Performance problem
+description: Low FPS, stutters, or the game runs worse than expected.
+title: "[Perf] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Where to find your logs:**
+        - **Windows:** `Documents\MarioWiiSaveData\Logs`
+        - **Linux:** `~/.local/share/WiiCompiled/Logs`
+        - **Android:** connect the phone to a computer with a USB cable and open `Android/data/com.wither.nsmbw/files/Logs`
+
+        Every run gets its own folder. Open the **newest** one and attach `console.log`. Turning on **Show FPS Counter** (Settings > Video) helps you tell us how slow it gets.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you continue
+      options:
+        - label: I'm on the latest release.
+          required: true
+        - label: I searched the existing issues and nobody has reported this yet.
+          required: true
+        - label: Nothing else was hogging the device (recording software, browser video, battery saver, etc.).
+          required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Android
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release you downloaded (it's in the file name).
+      placeholder: "e.g. 0.1.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: pattern
+    attributes:
+      label: What does the problem look like?
+      options:
+        - Constant low FPS everywhere
+        - Stutters / hitches (mostly smooth, brief freezes)
+        - Only certain levels or situations are slow
+        - Only in LAN games
+        - Got worse after an update
+    validations:
+      required: true
+  - type: textarea
+    id: doing
+    attributes:
+      label: When does it happen?
+      description: Which levels, how many players, LAN or not, and roughly what FPS you see.
+      placeholder: "e.g. Drops to ~40 FPS in World 5-Tower with four players, fine on the world map…"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Attach `console.log` from your newest run folder.
+      render: text
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Phone model, or the PC's CPU and GPU (with the driver version).
+      placeholder: "e.g. Pixel 7 / Ryzen 5 5600 + RTX 3060, driver 560.94"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS version
+      placeholder: "e.g. Android 14 / Windows 11 24H2 / Fedora 44"
+    validations:
+      required: true
